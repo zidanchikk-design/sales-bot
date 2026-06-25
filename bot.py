@@ -3,6 +3,8 @@ import json
 import base64
 import logging
 import re
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
@@ -18,7 +20,21 @@ TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 SPREADSHEET_ID = os.environ["SPREADSHEET_ID"]
 SHEET_NAME = os.environ.get("SHEET_NAME", "Лист1")
-GOOGLE_CREDS_JSON = os.environ["GOOGLE_CREDS_JSON"]  # весь JSON как строка
+GOOGLE_CREDS_JSON = os.environ["GOOGLE_CREDS_JSON"]
+PORT = int(os.environ.get("PORT", 8080))
+
+# ─── HEALTH CHECK сервер (нужен для Render) ────────────────────────────────────
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+    def log_message(self, format, *args):
+        pass  # отключаем лишние логи
+
+def run_health_server():
+    server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
+    server.serve_forever()
 
 # ─── GOOGLE SHEETS ─────────────────────────────────────────────────────────────
 def get_sheet():
@@ -30,9 +46,9 @@ def get_sheet():
     return sh.worksheet(SHEET_NAME)
 
 def get_next_sale_number(sheet):
-    values = sheet.col_values(1)  # колонка "№ продажи"
+    values = sheet.col_values(1)
     nums = []
-    for v in values[1:]:  # пропускаем заголовок
+    for v in values[1:]:
         try:
             nums.append(int(v))
         except:
@@ -40,7 +56,6 @@ def get_next_sale_number(sheet):
     return (max(nums) + 1) if nums else 1
 
 def append_sales(items: list[dict]):
-    """items = [{"date": "24.06.26", "name": "...", "qty": 1, "price": 450}, ...]"""
     sheet = get_sheet()
     next_num = get_next_sale_number(sheet)
     rows = []
@@ -50,7 +65,7 @@ def append_sales(items: list[dict]):
             item["date"],
             item["name"],
             item["qty"],
-            "",           # "сколько денег получим с" — пропускаем
+            "",
             item["price"]
         ])
     sheet.append_rows(rows, value_input_option="USER_ENTERED")
@@ -82,7 +97,6 @@ SYSTEM_PROMPT = """Ты помощник, который извлекает да
 
 def extract_sales_from_image(image_bytes: bytes, caption: str = "", current_date: str = "") -> list[dict]:
     image_b64 = base64.standard_b64encode(image_bytes).decode("utf-8")
-    
     user_text = "Извлеки данные о продажах из этого изображения."
     if caption:
         user_text += f"\nПодпись к фото: {caption}"
@@ -101,18 +115,15 @@ def extract_sales_from_image(image_bytes: bytes, caption: str = "", current_date
             ]
         }]
     )
-    
     raw = response.content[0].text.strip()
     raw = re.sub(r"```json|```", "", raw).strip()
     items = json.loads(raw)
     return items if isinstance(items, list) else [items]
 
 # ─── STATE ─────────────────────────────────────────────────────────────────────
-# Храним последнюю известную дату для каждого чата
 chat_dates: dict[int, str] = {}
 
 def parse_date_from_text(text: str) -> str | None:
-    """Ищем дату в тексте вида 24.06.26 или 24.06.2026"""
     patterns = [
         r"\b(\d{2}\.\d{2}\.\d{4})\b",
         r"\b(\d{2}\.\d{2}\.\d{2})\b",
@@ -128,39 +139,34 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     if not msg:
         return
-    
+
     chat_id = msg.chat_id
 
-    # 1. Проверяем — не дата ли это?
     if msg.text:
         date = parse_date_from_text(msg.text)
         if date:
             chat_dates[chat_id] = date
             logger.info(f"Чат {chat_id}: установлена дата {date}")
-            return  # просто запомнили дату, ничего не делаем
+            return
 
-    # 2. Если нет фото — игнорируем
     if not msg.photo and not msg.document:
         return
 
-    # Текущая дата для этого чата
     current_date = chat_dates.get(chat_id, datetime.now().strftime("%d.%m.%y"))
     caption = msg.caption or ""
 
-    # Скачиваем фото
     if msg.photo:
-        photo = msg.photo[-1]  # наибольшее разрешение
+        photo = msg.photo[-1]
         file = await context.bot.get_file(photo.file_id)
     else:
         file = await context.bot.get_file(msg.document.file_id)
 
     image_bytes = await file.download_as_bytearray()
 
-    # Обрабатываем
     try:
         await msg.reply_text("⏳ Распознаю продажу...")
         items = extract_sales_from_image(bytes(image_bytes), caption, current_date)
-        
+
         if not items:
             await msg.reply_text("❌ Не удалось распознать товары на изображении.")
             return
@@ -170,11 +176,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         start_num, count = append_sales(items)
 
-        # Формируем отчёт
         lines = [f"✅ Добавлено {count} позиц{'ия' if count==1 else 'ии' if count in [2,3,4] else 'ий'} (№{start_num}–{start_num+count-1}):"]
         for item in items:
             lines.append(f"  • {item['name']} — {item['price']} руб. × {item['qty']} шт.")
-        
+
         await msg.reply_text("\n".join(lines))
 
     except json.JSONDecodeError as e:
@@ -186,6 +191,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ─── MAIN ──────────────────────────────────────────────────────────────────────
 def main():
+    # Запускаем health check сервер в отдельном потоке
+    t = threading.Thread(target=run_health_server, daemon=True)
+    t.start()
+    logger.info(f"Health check сервер запущен на порту {PORT}")
+
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(MessageHandler(filters.ALL, handle_message))
     logger.info("Бот запущен!")

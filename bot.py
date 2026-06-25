@@ -8,7 +8,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
-import anthropic
+import google.generativeai as genai
 import gspread
 from google.oauth2.service_account import Credentials
 
@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
-ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
+GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 SPREADSHEET_ID = os.environ["SPREADSHEET_ID"]
 SHEET_NAME = os.environ.get("SHEET_NAME", "Лист1")
 GOOGLE_CREDS_JSON = os.environ["GOOGLE_CREDS_JSON"]
@@ -30,7 +30,7 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b"OK")
     def log_message(self, format, *args):
-        pass  # отключаем лишние логи
+        pass
 
 def run_health_server():
     server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
@@ -72,20 +72,21 @@ def append_sales(items: list[dict]):
     logger.info(f"Добавлено {len(rows)} строк начиная с № {next_num}")
     return next_num, len(rows)
 
-# ─── ANTHROPIC VISION ──────────────────────────────────────────────────────────
-claude_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+# ─── GEMINI VISION ─────────────────────────────────────────────────────────────
+genai.configure(api_key=GEMINI_API_KEY)
+gemini_model = genai.GenerativeModel("gemini-1.5-flash")
 
-SYSTEM_PROMPT = """Ты помощник, который извлекает данные о продажах из изображений для магазина детских товаров.
+PROMPT_TEMPLATE = """Ты помощник, который извлекает данные о продажах из изображений для магазина детских товаров.
 
 На входе — фото чека, скриншот кассовой программы, или фото этикетки товара с ценой в подписи.
 
 Верни ТОЛЬКО валидный JSON массив объектов без пояснений и без ```json блоков.
 Каждый объект:
-{
+{{
   "name": "полное наименование товара как на чеке/этикетке, включая размер если есть",
   "qty": число (количество штук),
   "price": число (цена в рублях, целое число)
-}
+}}
 
 Правила:
 1. ЧЕК С ОПЛАТОЙ КАРТОЙ: если рядом с итогом от руки написана другая сумма — это реальная сумма к получению. Разница (напечатанная минус рукописная) вычитается из цены САМОЙ ДОРОГОЙ позиции.
@@ -93,29 +94,22 @@ SYSTEM_PROMPT = """Ты помощник, который извлекает да
 3. ФОТО ЭТИКЕТКИ: брать наименование с этикетки (включая размер), цена будет в подписи к фото.
 4. Если на чеке несколько товаров — вернуть массив из нескольких объектов.
 5. Количество всегда 1, если не указано иное.
-6. Дату НЕ включай — она передаётся отдельно."""
+6. Дату НЕ включай — она передаётся отдельно.{caption_part}{date_part}
+
+Извлеки данные о продажах из этого изображения."""
 
 def extract_sales_from_image(image_bytes: bytes, caption: str = "", current_date: str = "") -> list[dict]:
-    image_b64 = base64.standard_b64encode(image_bytes).decode("utf-8")
-    user_text = "Извлеки данные о продажах из этого изображения."
-    if caption:
-        user_text += f"\nПодпись к фото: {caption}"
-    if current_date:
-        user_text += f"\nДата продажи: {current_date}"
+    caption_part = f"\nПодпись к фото: {caption}" if caption else ""
+    date_part = f"\nДата продажи: {current_date}" if current_date else ""
+    prompt = PROMPT_TEMPLATE.format(caption_part=caption_part, date_part=date_part)
 
-    response = claude_client.messages.create(
-        model="claude-opus-4-6",
-        max_tokens=1000,
-        system=SYSTEM_PROMPT,
-        messages=[{
-            "role": "user",
-            "content": [
-                {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": image_b64}},
-                {"type": "text", "text": user_text}
-            ]
-        }]
-    )
-    raw = response.content[0].text.strip()
+    image_part = {
+        "mime_type": "image/jpeg",
+        "data": image_bytes
+    }
+
+    response = gemini_model.generate_content([prompt, image_part])
+    raw = response.text.strip()
     raw = re.sub(r"```json|```", "", raw).strip()
     items = json.loads(raw)
     return items if isinstance(items, list) else [items]
@@ -191,7 +185,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ─── MAIN ──────────────────────────────────────────────────────────────────────
 def main():
-    # Запускаем health check сервер в отдельном потоке
     t = threading.Thread(target=run_health_server, daemon=True)
     t.start()
     logger.info(f"Health check сервер запущен на порту {PORT}")

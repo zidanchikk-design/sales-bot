@@ -4,6 +4,7 @@ import base64
 import logging
 import re
 import threading
+import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime
 from telegram import Update
@@ -19,11 +20,29 @@ logger = logging.getLogger(__name__)
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 SPREADSHEET_ID = os.environ["SPREADSHEET_ID"]
-SHEET_NAME = os.environ.get("SHEET_NAME", "Лист1")
+SHEET_NAME = os.environ.get("SHEET_NAME", "продажи Спб")
 GOOGLE_CREDS_JSON = os.environ["GOOGLE_CREDS_JSON"]
 PORT = int(os.environ.get("PORT", 8080))
 
-# ─── HEALTH CHECK сервер (нужен для Render) ────────────────────────────────────
+# Листы категорий и столбцы (количество, цена)
+CATEGORY_SHEETS = {
+    "Игрушки":        ("H", "I"),
+    "Одежда":         ("F", "G"),
+    "Обувь":          ("E", "F"),
+    "Крупное":        ("J", "K"),
+    "Канцтовары":     ("E", "F"),
+    "Книги":          ("E", "F"),
+    "Украшения":      ("E", "F"),
+    "Спорт":          ("G", "H"),
+    "Детские товары": ("D", "E"),
+    "Сумки и рюкзаки":("D", "E"),
+}
+
+def col_letter_to_index(letter: str) -> int:
+    """A=1, B=2, ..."""
+    return ord(letter.upper()) - ord('A') + 1
+
+# ─── HEALTH CHECK ─────────────────────────────────────────────────────────────
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -37,13 +56,27 @@ def run_health_server():
     server.serve_forever()
 
 # ─── GOOGLE SHEETS ─────────────────────────────────────────────────────────────
-def get_sheet():
-    creds_dict = json.loads(GOOGLE_CREDS_JSON)
-    scopes = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-    creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
-    gc = gspread.authorize(creds)
-    sh = gc.open_by_key(SPREADSHEET_ID)
-    return sh.worksheet(SHEET_NAME)
+_gc = None
+_spreadsheet = None
+
+def get_client():
+    global _gc, _spreadsheet
+    if _gc is None:
+        creds_dict = json.loads(GOOGLE_CREDS_JSON)
+        scopes = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+        creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+        _gc = gspread.authorize(creds)
+        _spreadsheet = _gc.open_by_key(SPREADSHEET_ID)
+    return _spreadsheet
+
+def get_main_sheet():
+    return get_client().worksheet(SHEET_NAME)
+
+def get_category_sheet(name: str):
+    try:
+        return get_client().worksheet(name)
+    except Exception:
+        return None
 
 def get_next_sale_number(sheet):
     values = sheet.col_values(1)
@@ -55,22 +88,104 @@ def get_next_sale_number(sheet):
             pass
     return (max(nums) + 1) if nums else 1
 
+def col_index(letter):
+    return ord(letter.upper()) - ord('A') + 1
+
+def find_in_category(sheet, item: dict):
+    """
+    Ищем строку в листе категории по артикулу + название + цвет + размер.
+    Возвращает номер строки (1-based) или None.
+    """
+    name = item.get("name", "").lower()
+    # Извлекаем артикул из названия
+    art_match = re.search(r'арт\.?\s*([A-Za-zА-Яа-я0-9\-]+)', name)
+    article = art_match.group(1).lower() if art_match else None
+
+    all_values = sheet.col_values(1)  # колонка A — наименование
+    for i, cell in enumerate(all_values):
+        if i == 0:
+            continue  # пропускаем заголовок
+        cell_lower = cell.lower()
+        if not cell_lower:
+            continue
+        # Проверяем артикул если есть
+        if article:
+            if article not in cell_lower:
+                continue
+        # Проверяем что основное название совпадает (первые значимые слова)
+        # Берём первые 3 слова из названия товара (до артикула)
+        name_part = re.split(r'арт\.?', name)[0].strip()
+        name_words = [w for w in name_part.split() if len(w) > 2][:3]
+        if name_words and not all(w in cell_lower for w in name_words):
+            continue
+        return i + 1  # gspread строки 1-based
+    return None
+
+def update_category(sheet, row: int, qty: int, price, col_qty: str, col_price: str):
+    """Прибавляем количество и дописываем +цена в листе категории."""
+    # Количество
+    qty_idx = col_index(col_qty)
+    price_idx = col_index(col_price)
+
+    current_qty = sheet.cell(row, qty_idx).value
+    try:
+        new_qty = int(current_qty or 0) + qty
+    except:
+        new_qty = qty
+    sheet.update_cell(row, qty_idx, new_qty)
+
+    # Цена
+    current_price = sheet.cell(row, price_idx).value or ""
+    price_str = str(int(price) if price == int(price) else price)
+    if current_price.strip():
+        new_price = current_price.strip() + "+" + price_str
+    else:
+        new_price = price_str
+    sheet.update_cell(row, price_idx, new_price)
+
 def append_sales(items: list[dict]):
-    sheet = get_sheet()
-    next_num = get_next_sale_number(sheet)
+    main_sheet = get_main_sheet()
+    next_num = get_next_sale_number(main_sheet)
     rows = []
+    category_results = []  # (found: bool, category_name: str)
+
     for i, item in enumerate(items):
+        # Ищем в категориях
+        found_category = None
+        found_row = None
+        for cat_name, (col_qty, col_price) in CATEGORY_SHEETS.items():
+            cat_sheet = get_category_sheet(cat_name)
+            if cat_sheet is None:
+                continue
+            row = find_in_category(cat_sheet, item)
+            if row:
+                found_category = cat_name
+                found_row = row
+                # Обновляем категорию
+                try:
+                    update_category(cat_sheet, row, item["qty"], item["price"], col_qty, col_price)
+                    logger.info(f"Обновлена категория '{cat_name}', строка {row}")
+                except Exception as e:
+                    logger.error(f"Ошибка обновления категории: {e}")
+                break
+
+        # Формируем строку для основного листа
+        note = "" if found_category else "не найдено в описи"
         rows.append([
             next_num + i,
             item["date"],
             item["name"],
             item["qty"],
             "",
-            item["price"]
+            item["price"],
+            "", "", "", "", "", "", "", note
         ])
-    sheet.append_rows(rows, value_input_option="USER_ENTERED")
+        category_results.append((found_category is not None, found_category or ""))
+        time.sleep(1)  # пауза чтобы не превысить лимиты API Google
+
+    main_sheet.append_rows(rows, value_input_option="USER_ENTERED")
     logger.info(f"Добавлено {len(rows)} строк начиная с № {next_num}")
-    return next_num, len(rows)
+    return next_num, len(rows), category_results
 
 # ─── GEMINI VISION ─────────────────────────────────────────────────────────────
 genai.configure(api_key=GEMINI_API_KEY)
@@ -78,7 +193,7 @@ gemini_model = genai.GenerativeModel("gemini-2.5-flash")
 
 PROMPT_TEMPLATE = """Ты помощник, который извлекает данные о продажах из изображений для магазина детских товаров.
 
-На входе — фото чека, скриншот кассовой программы, или фото этикетки товара с ценой в подписи.
+На входе — фото чека, скриншот кассовой программы, или фото этикетки товара с ценой в подписи. Иногда чек занимает два фото — тогда тебе передают оба.
 
 Верни ТОЛЬКО валидный JSON массив объектов без пояснений и без ```json блоков.
 Каждый объект:
@@ -97,29 +212,30 @@ PROMPT_TEMPLATE = """Ты помощник, который извлекает д
 Правила карточной оплаты:
 - Если рядом с напечатанным итогом чека написана другая сумма от руки — это реальная сумма наличными/к получению
 - Разница = напечатанный итог МИНУС рукописная сумма
-- Эту разницу вычти из price САМОЙ ДОРОГОЙ позиции
+- Эту разницу вычти из price САМОЙ ДОРОГОЙ позиции по всем товарам
 - Пример: напечатано 1530, написано от руки 1468.8 → разница 61.2 → вычти 61.2 из самой дорогой позиции
 
 Другие правила:
 1. СКРИНШОТ КАССЫ: брать наименование и итоговую сумму по позиции.
-3. ФОТО ЭТИКЕТКИ: брать наименование с этикетки включая размер и артикул (если есть), цена будет в подписи к фото, qty=1.
+2. ФОТО ЭТИКЕТКИ: брать наименование с этикетки включая размер и артикул (если есть), цена будет в подписи к фото, qty=1.
 3. Если на чеке несколько товаров — вернуть массив из нескольких объектов.
 4. Количество всегда 1, если не указано иное.
 5. Дату НЕ включай — она передаётся отдельно.{caption_part}{date_part}
 
-Извлеки данные о продажах из этого изображения."""
+Извлеки данные о продажах из этого изображения (или двух фото одного чека)."""
 
-def extract_sales_from_image(image_bytes: bytes, caption: str = "", current_date: str = "") -> list[dict]:
-    caption_part = f"\nПодпись к фото: {caption}" if caption else ""
+def extract_sales_from_images(images: list[tuple[bytes, str]], current_date: str = "") -> list[dict]:
+    """images — список (image_bytes, caption)"""
+    captions = [cap for _, cap in images if cap]
+    caption_part = f"\nПодписи к фото: {'; '.join(captions)}" if captions else ""
     date_part = f"\nДата продажи: {current_date}" if current_date else ""
     prompt = PROMPT_TEMPLATE.format(caption_part=caption_part, date_part=date_part)
 
-    image_part = {
-        "mime_type": "image/jpeg",
-        "data": image_bytes
-    }
+    content = [prompt]
+    for image_bytes, _ in images:
+        content.append({"mime_type": "image/jpeg", "data": image_bytes})
 
-    response = gemini_model.generate_content([prompt, image_part])
+    response = gemini_model.generate_content(content)
     raw = response.text.strip()
     raw = re.sub(r"```json|```", "", raw).strip()
     items = json.loads(raw)
@@ -127,6 +243,8 @@ def extract_sales_from_image(image_bytes: bytes, caption: str = "", current_date
 
 # ─── STATE ─────────────────────────────────────────────────────────────────────
 chat_dates: dict[int, str] = {}
+# Буфер для альбомов (media_group): media_group_id -> {photos, first_msg, date, task}
+media_group_buffer: dict[str, dict] = {}
 
 def parse_date_from_text(text: str) -> str | None:
     patterns = [
@@ -140,7 +258,36 @@ def parse_date_from_text(text: str) -> str | None:
     return None
 
 # ─── HANDLERS ──────────────────────────────────────────────────────────────────
+async def process_images(images: list[tuple[bytes, str]], current_date: str, reply_msg):
+    """Обрабатываем одно или несколько фото, вносим в таблицу."""
+    try:
+        items = extract_sales_from_images(images, current_date)
+
+        if not items:
+            await reply_msg.reply_text("❌ Не удалось распознать товары на изображении.")
+            return
+
+        for item in items:
+            item["date"] = current_date
+
+        start_num, count, cat_results = append_sales(items)
+
+        lines = [f"✅ Добавлено {count} позиц{'ия' if count==1 else 'ии' if count in [2,3,4] else 'ий'} (№{start_num}–{start_num+count-1}):"]
+        for item, (found, cat_name) in zip(items, cat_results):
+            cat_info = f" [📂 {cat_name}]" if found else " [⚠️ не найдено в описи]"
+            lines.append(f"  • {item['name']} — {item['price']} руб. × {item['qty']} шт.{cat_info}")
+
+        await reply_msg.reply_text("\n".join(lines))
+
+    except json.JSONDecodeError as e:
+        logger.error(f"JSON parse error: {e}")
+        await reply_msg.reply_text("❌ Ошибка распознавания. Попробуй ещё раз или добавь вручную.")
+    except Exception as e:
+        logger.error(f"Error: {e}", exc_info=True)
+        await reply_msg.reply_text(f"❌ Ошибка: {str(e)[:200]}")
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    import asyncio
     msg = update.message
     if not msg:
         return
@@ -152,7 +299,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if date:
             chat_dates[chat_id] = date
             logger.info(f"Чат {chat_id}: установлена дата {date}")
-            return
+        return
 
     if not msg.photo and not msg.document:
         return
@@ -161,38 +308,37 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     caption = msg.caption or ""
 
     if msg.photo:
-        photo = msg.photo[-1]
-        file = await context.bot.get_file(photo.file_id)
+        file = await context.bot.get_file(msg.photo[-1].file_id)
     else:
         file = await context.bot.get_file(msg.document.file_id)
 
-    image_bytes = await file.download_as_bytearray()
+    image_bytes = bytes(await file.download_as_bytearray())
 
-    try:
-        await msg.reply_text("⏳ Распознаю продажу...")
-        items = extract_sales_from_image(bytes(image_bytes), caption, current_date)
+    # Если фото часть альбома (media_group) — собираем все фото вместе
+    if msg.media_group_id:
+        group_id = msg.media_group_id
+        if group_id not in media_group_buffer:
+            media_group_buffer[group_id] = {
+                "photos": [],
+                "first_msg": msg,
+                "date": current_date,
+            }
+            # Запускаем отложенную обработку через 3 секунды
+            async def process_group(gid=group_id):
+                await asyncio.sleep(3)
+                if gid not in media_group_buffer:
+                    return
+                group = media_group_buffer.pop(gid)
+                await group["first_msg"].reply_text(f"⏳ Распознаю продажу ({len(group['photos'])} фото)...")
+                await process_images(group["photos"], group["date"], group["first_msg"])
+            asyncio.create_task(process_group())
 
-        if not items:
-            await msg.reply_text("❌ Не удалось распознать товары на изображении.")
-            return
+        media_group_buffer[group_id]["photos"].append((image_bytes, caption))
+        return
 
-        for item in items:
-            item["date"] = current_date
-
-        start_num, count = append_sales(items)
-
-        lines = [f"✅ Добавлено {count} позиц{'ия' if count==1 else 'ии' if count in [2,3,4] else 'ий'} (№{start_num}–{start_num+count-1}):"]
-        for item in items:
-            lines.append(f"  • {item['name']} — {item['price']} руб. × {item['qty']} шт.")
-
-        await msg.reply_text("\n".join(lines))
-
-    except json.JSONDecodeError as e:
-        logger.error(f"JSON parse error: {e}")
-        await msg.reply_text("❌ Ошибка распознавания. Попробуй ещё раз или добавь вручную.")
-    except Exception as e:
-        logger.error(f"Error: {e}", exc_info=True)
-        await msg.reply_text(f"❌ Ошибка: {str(e)[:200]}")
+    # Одиночное фото — обрабатываем сразу
+    await msg.reply_text("⏳ Распознаю продажу...")
+    await process_images([(image_bytes, caption)], current_date, msg)
 
 # ─── MAIN ──────────────────────────────────────────────────────────────────────
 def main():

@@ -93,33 +93,44 @@ def col_index(letter):
 
 def find_in_category(sheet, item: dict):
     """
-    Ищем строку в листе категории по артикулу + название + цвет + размер.
+    Ищем строку в листе категории через Gemini.
     Возвращает номер строки (1-based) или None.
     """
-    name = item.get("name", "").lower()
-    # Извлекаем артикул из названия
-    art_match = re.search(r'арт\.?\s*([A-Za-zА-Яа-я0-9\-]+)', name)
-    article = art_match.group(1).lower() if art_match else None
-
     all_values = sheet.col_values(1)  # колонка A — наименование
+    # Собираем список товаров с номерами строк (пропускаем заголовок)
+    candidates = []
     for i, cell in enumerate(all_values):
-        if i == 0:
-            continue  # пропускаем заголовок
-        cell_lower = cell.lower()
-        if not cell_lower:
+        if i == 0 or not cell.strip():
             continue
-        # Проверяем артикул если есть
-        if article:
-            if article not in cell_lower:
-                continue
-        # Проверяем что основное название совпадает (первые значимые слова)
-        # Берём первые 3 слова из названия товара (до артикула)
-        name_part = re.split(r'арт\.?', name)[0].strip()
-        name_words = [w for w in name_part.split() if len(w) > 2][:3]
-        if name_words and not all(w in cell_lower for w in name_words):
-            continue
-        return i + 1  # gspread строки 1-based
-    return None
+        candidates.append((i + 1, cell))  # (row_number, name)
+
+    if not candidates:
+        return None
+
+    # Формируем список для Gemini
+    candidates_text = "\n".join([f"{row}. {name}" for row, name in candidates])
+    item_name = item.get("name", "")
+
+    prompt = f"""Ты помощник по поиску товаров в списке.
+
+Нужно найти в списке товар, который соответствует запросу. Сопоставляй по артикулу (самое важное), названию, цвету и размеру если они есть. Небольшие различия в регистре или пунктуации игнорируй.
+
+Товар для поиска: {item_name}
+
+Список товаров (номер строки. название):
+{candidates_text}
+
+Если нашёл совпадение — верни ТОЛЬКО номер строки (число). Если не нашёл — верни ТОЛЬКО слово null."""
+
+    try:
+        response = gemini_model.generate_content(prompt)
+        result = response.text.strip()
+        if result.lower() == "null":
+            return None
+        return int(result)
+    except Exception as e:
+        logger.error(f"Ошибка поиска через Gemini: {e}")
+        return None
 
 def update_category(sheet, row: int, qty: int, price, col_qty: str, col_price: str):
     """Прибавляем количество и дописываем +цена в листе категории."""

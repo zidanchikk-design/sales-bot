@@ -91,43 +91,79 @@ def get_next_sale_number(sheet):
 def col_index(letter):
     return ord(letter.upper()) - ord('A') + 1
 
+def extract_article(name: str) -> str | None:
+    """Извлекаем артикул из названия товара — всё что после 'арт'"""
+    m = re.search(r'арт[.\s]*[\(]?\s*([^\s\),]+)', name, re.IGNORECASE)
+    if m:
+        # Оставляем только буквы и цифры для нечёткого сравнения
+        return re.sub(r'[^a-zA-Zа-яА-Я0-9]', '', m.group(1)).lower()
+    return None
+
+def fuzzy_article_match(art1: str, art2: str) -> bool:
+    """Сравниваем артикулы нечётко - только буквы и цифры, без учёта регистра и кириллица=латиница"""
+    # Заменяем похожие кириллические на латинские
+    def normalize(s):
+        s = s.lower()
+        replacements = {'а':'a','е':'e','о':'o','р':'p','с':'c','х':'x','у':'y','в':'b'}
+        return ''.join(replacements.get(c, c) for c in s)
+    a1 = normalize(re.sub(r'[^a-zA-Zа-яА-Я0-9]', '', art1))
+    a2 = normalize(re.sub(r'[^a-zA-Zа-яА-Я0-9]', '', art2))
+    return a1 == a2
+
 def find_in_category(sheet, item: dict):
     """
-    Ищем строку в листе категории через Gemini.
+    Ищем строку в листе категории.
+    1. Фильтруем по артикулу (нечёткое совпадение)
+    2. Если кандидатов мало — Gemini выбирает финальный ответ
     Возвращает номер строки (1-based) или None.
     """
-    all_values = sheet.col_values(1)  # колонка A — наименование
-    # Собираем список товаров с номерами строк (пропускаем заголовок)
+    all_values = sheet.col_values(1)
+    item_name = item.get("name", "")
+    item_art = extract_article(item_name)
+
+    # Шаг 1: фильтруем кандидатов по артикулу
     candidates = []
     for i, cell in enumerate(all_values):
         if i == 0 or not cell.strip():
             continue
-        candidates.append((i + 1, cell))  # (row_number, name)
+        row = i + 1
+        if item_art:
+            cell_art = extract_article(cell)
+            if cell_art and fuzzy_article_match(item_art, cell_art):
+                candidates.append((row, cell))
+        else:
+            # Нет артикула — берём все непустые строки (Gemini разберётся)
+            candidates.append((row, cell))
 
     if not candidates:
         return None
 
-    # Формируем список для Gemini
+    # Если один кандидат — возвращаем сразу
+    if len(candidates) == 1:
+        return candidates[0][0]
+
+    # Если кандидатов много и нет артикула — ограничиваем до 50
+    if len(candidates) > 50:
+        candidates = candidates[:50]
+
+    # Шаг 2: Gemini выбирает из кандидатов
     candidates_text = "\n".join([f"{row}. {name}" for row, name in candidates])
-    item_name = item.get("name", "")
+    prompt = f"""Найди в списке товар который соответствует запросу.
+Сопоставляй по артикулу, названию, цвету и размеру. Игнорируй различия в регистре, пунктуации, порядке слов, русских/латинских буквах (а/a, е/e, о/o, с/c, р/p, х/x).
 
-    prompt = f"""Ты помощник по поиску товаров в списке.
+Товар: {item_name}
 
-Нужно найти в списке товар, который соответствует запросу. Сопоставляй по артикулу (самое важное), названию, цвету и размеру если они есть. Небольшие различия в регистре или пунктуации игнорируй.
-
-Товар для поиска: {item_name}
-
-Список товаров (номер строки. название):
+Список (номер. название):
 {candidates_text}
 
-Если нашёл совпадение — верни ТОЛЬКО номер строки (число). Если не нашёл — верни ТОЛЬКО слово null."""
+Верни ТОЛЬКО номер строки если нашёл совпадение, или null если не нашёл."""
 
     try:
         response = gemini_model.generate_content(prompt)
         result = response.text.strip()
         if result.lower() == "null":
             return None
-        return int(result)
+        return int(re.search(r'\d+', result).group())
     except Exception as e:
         logger.error(f"Ошибка поиска через Gemini: {e}")
         return None

@@ -1,6 +1,5 @@
 import os
 import json
-import base64
 import logging
 import re
 import threading
@@ -24,23 +23,18 @@ SHEET_NAME = os.environ.get("SHEET_NAME", "продажи Спб")
 GOOGLE_CREDS_JSON = os.environ["GOOGLE_CREDS_JSON"]
 PORT = int(os.environ.get("PORT", 8080))
 
-# Листы категорий и столбцы (количество, цена)
 CATEGORY_SHEETS = {
-    "Игрушки":        ("H", "I"),
-    "Одежда":         ("F", "G"),
-    "Обувь":          ("E", "F"),
-    "Крупное":        ("J", "K"),
-    "Канцтовары":     ("E", "F"),
-    "Книги":          ("E", "F"),
-    "Украшения":      ("E", "F"),
-    "Спорт":          ("G", "H"),
-    "Детские товары": ("D", "E"),
-    "Сумки и рюкзаки":("D", "E"),
+    "Игрушки":         ("H", "I"),
+    "Одежда":          ("F", "G"),
+    "Обувь":           ("E", "F"),
+    "Крупное":         ("J", "K"),
+    "Канцтовары":      ("E", "F"),
+    "Книги":           ("E", "F"),
+    "Украшения":       ("E", "F"),
+    "Спорт":           ("G", "H"),
+    "Детские товары":  ("D", "E"),
+    "Сумки и рюкзаки": ("D", "E"),
 }
-
-def col_letter_to_index(letter: str) -> int:
-    """A=1, B=2, ..."""
-    return ord(letter.upper()) - ord('A') + 1
 
 # ─── HEALTH CHECK ─────────────────────────────────────────────────────────────
 class HealthHandler(BaseHTTPRequestHandler):
@@ -91,86 +85,80 @@ def get_next_sale_number(sheet):
 def col_index(letter):
     return ord(letter.upper()) - ord('A') + 1
 
-def extract_article(name: str) -> str | None:
-    """Извлекаем артикул из названия товара — всё что после 'арт'"""
-    m = re.search(r'арт[.\s]*[\(]?\s*([^\s\),]+)', name, re.IGNORECASE)
+def extract_article_raw(name: str) -> str | None:
+    """Извлекаем артикул как есть — всё что после 'арт.' до скобки, запятой или конца строки."""
+    m = re.search(r'арт[.\s]*\(?\s*([^\s\),]+(?:\s+[^\s\),]+)*)', name, re.IGNORECASE)
     if m:
-        # Оставляем только буквы и цифры для нечёткого сравнения
-        return re.sub(r'[^a-zA-Zа-яА-Я0-9]', '', m.group(1)).lower()
+        return m.group(1).strip().rstrip(')')
     return None
 
-def fuzzy_article_match(art1: str, art2: str) -> bool:
-    """Сравниваем артикулы нечётко - только буквы и цифры, без учёта регистра и кириллица=латиница"""
-    # Заменяем похожие кириллические на латинские
-    def normalize(s):
-        s = s.lower()
-        replacements = {'а':'a','е':'e','о':'o','р':'p','с':'c','х':'x','у':'y','в':'b'}
-        return ''.join(replacements.get(c, c) for c in s)
-    a1 = normalize(re.sub(r'[^a-zA-Zа-яА-Я0-9]', '', art1))
-    a2 = normalize(re.sub(r'[^a-zA-Zа-яА-Я0-9]', '', art2))
-    return a1 == a2
+def normalize(s: str) -> str:
+    """Нормализуем строку: нижний регистр, кириллица→латиница для похожих букв."""
+    s = s.lower()
+    replacements = {'а':'a','е':'e','о':'o','р':'p','с':'c','х':'x','у':'y','в':'b','к':'k','м':'m','т':'t'}
+    return ''.join(replacements.get(c, c) for c in s)
 
 def find_in_category(sheet, item: dict):
     """
-    Ищем строку в листе категории.
-    1. Фильтруем по артикулу (нечёткое совпадение)
-    2. Если кандидатов мало — Gemini выбирает финальный ответ
-    Возвращает номер строки (1-based) или None.
+    Поиск товара в листе категории:
+    1. Берём артикул из названия товара
+    2. Ищем все строки где этот артикул встречается как подстрока (нормализованно)
+    3. Если один кандидат — возвращаем его
+    4. Если несколько — Gemini выбирает наиболее похожий
     """
     all_values = sheet.col_values(1)
     item_name = item.get("name", "")
-    item_art = extract_article(item_name)
+    article_raw = extract_article_raw(item_name)
 
-    # Шаг 1: фильтруем кандидатов по артикулу
+    if not article_raw:
+        logger.info(f"Артикул не найден в названии: {item_name}")
+        return None
+
+    article_norm = normalize(article_raw)
+    logger.info(f"Ищем артикул: '{article_raw}' (норм: '{article_norm}')")
+
     candidates = []
     for i, cell in enumerate(all_values):
         if i == 0 or not cell.strip():
             continue
-        row = i + 1
-        if item_art:
-            cell_art = extract_article(cell)
-            if cell_art and fuzzy_article_match(item_art, cell_art):
-                candidates.append((row, cell))
-        else:
-            # Нет артикула — берём все непустые строки (Gemini разберётся)
-            candidates.append((row, cell))
+        if article_norm in normalize(cell):
+            candidates.append((i + 1, cell))
+
+    logger.info(f"Найдено кандидатов: {len(candidates)}")
 
     if not candidates:
         return None
 
-    # Если один кандидат — возвращаем сразу
     if len(candidates) == 1:
+        logger.info(f"Единственный кандидат: {candidates[0][1]}")
         return candidates[0][0]
 
-    # Если кандидатов много и нет артикула — ограничиваем до 50
-    if len(candidates) > 50:
-        candidates = candidates[:50]
-
-    # Шаг 2: Gemini выбирает из кандидатов
+    # Несколько кандидатов — Gemini выбирает
     candidates_text = "\n".join([f"{row}. {name}" for row, name in candidates])
     prompt = f"""Найди в списке товар который соответствует запросу.
-Сопоставляй по артикулу, названию, цвету и размеру. Игнорируй различия в регистре, пунктуации, порядке слов, русских/латинских буквах (а/a, е/e, о/o, с/c, р/p, х/x).
+Сопоставляй по артикулу, названию, цвету и размеру.
+Игнорируй различия в регистре, пунктуации, порядке слов, русских/латинских буквах.
 
-Товар: {item_name}
+Товар из чека: {item_name}
 
-Список (номер. название):
+Кандидаты (номер строки. название):
 {candidates_text}
 
-Верни ТОЛЬКО номер строки если нашёл совпадение, или null если не нашёл."""
+Верни ТОЛЬКО номер строки подходящего товара, или null если ни один не подходит."""
 
     try:
         response = gemini_model.generate_content(prompt)
         result = response.text.strip()
+        logger.info(f"Gemini выбрал: {result}")
         if result.lower() == "null":
             return None
-        return int(re.search(r'\d+', result).group())
+        m = re.search(r'\d+', result)
+        return int(m.group()) if m else None
     except Exception as e:
-        logger.error(f"Ошибка поиска через Gemini: {e}")
+        logger.error(f"Ошибка Gemini при выборе кандидата: {e}")
         return None
 
 def update_category(sheet, row: int, qty: int, price, col_qty: str, col_price: str):
-    """Прибавляем количество и дописываем +цена в листе категории."""
-    # Количество
     qty_idx = col_index(col_qty)
     price_idx = col_index(col_price)
 
@@ -181,9 +169,8 @@ def update_category(sheet, row: int, qty: int, price, col_qty: str, col_price: s
         new_qty = qty
     sheet.update_cell(row, qty_idx, new_qty)
 
-    # Цена
     current_price = sheet.cell(row, price_idx).value or ""
-    price_str = str(int(price) if price == int(price) else price)
+    price_str = str(int(price) if isinstance(price, float) and price == int(price) else price)
     if current_price.strip():
         new_price = current_price.strip() + "+" + price_str
     else:
@@ -194,12 +181,10 @@ def append_sales(items: list[dict]):
     main_sheet = get_main_sheet()
     next_num = get_next_sale_number(main_sheet)
     rows = []
-    category_results = []  # (found: bool, category_name: str)
+    category_results = []
 
     for i, item in enumerate(items):
-        # Ищем в категориях
         found_category = None
-        found_row = None
         for cat_name, (col_qty, col_price) in CATEGORY_SHEETS.items():
             cat_sheet = get_category_sheet(cat_name)
             if cat_sheet is None:
@@ -207,16 +192,14 @@ def append_sales(items: list[dict]):
             row = find_in_category(cat_sheet, item)
             if row:
                 found_category = cat_name
-                found_row = row
-                # Обновляем категорию
                 try:
                     update_category(cat_sheet, row, item["qty"], item["price"], col_qty, col_price)
                     logger.info(f"Обновлена категория '{cat_name}', строка {row}")
                 except Exception as e:
                     logger.error(f"Ошибка обновления категории: {e}")
                 break
+            time.sleep(0.5)
 
-        # Формируем строку для основного листа
         note = "" if found_category else "не найдено в описи"
         rows.append([
             next_num + i,
@@ -228,19 +211,18 @@ def append_sales(items: list[dict]):
             "", "", "", "", "", "", "", note
         ])
         category_results.append((found_category is not None, found_category or ""))
-        time.sleep(1)  # пауза чтобы не превысить лимиты API Google
 
     main_sheet.append_rows(rows, value_input_option="USER_ENTERED")
     logger.info(f"Добавлено {len(rows)} строк начиная с № {next_num}")
     return next_num, len(rows), category_results
 
-# ─── GEMINI VISION ─────────────────────────────────────────────────────────────
+# ─── GEMINI ────────────────────────────────────────────────────────────────────
 genai.configure(api_key=GEMINI_API_KEY)
 gemini_model = genai.GenerativeModel("gemini-2.5-flash")
 
 PROMPT_TEMPLATE = """Ты помощник, который извлекает данные о продажах из изображений для магазина детских товаров.
 
-На входе — фото чека, скриншот кассовой программы, или фото этикетки товара с ценой в подписи. Иногда чек занимает два фото — тогда тебе передают оба.
+На входе — фото чека, скриншот кассовой программы, или фото этикетки товара с ценой в подписи. Чек может быть разбит на несколько фото — обрабатывай их все как одну покупку.
 
 Верни ТОЛЬКО валидный JSON массив объектов без пояснений и без ```json блоков.
 Каждый объект:
@@ -253,26 +235,22 @@ PROMPT_TEMPLATE = """Ты помощник, который извлекает д
 Правила извлечения цены:
 - В чеке строка выглядит так: КОЛ-ВО х ЦЕНА_ЗА_ШТ = ИТОГ
 - Пример: "2.000 х 390.00=780.00" → qty=2, price=780 (берём ИТОГ, не цену за штуку!)
-- Пример: "1.000 х 180.00=180.00" → qty=1, price=180
 - В поле price всегда пиши ИТОГОВУЮ сумму по позиции (правая часть после знака =)
 
 Правила карточной оплаты:
-- Если рядом с напечатанным итогом чека написана другая сумма от руки — это реальная сумма наличными/к получению
+- Если рядом с напечатанным итогом чека написана другая сумма от руки — разница вычитается из самой дорогой позиции
 - Разница = напечатанный итог МИНУС рукописная сумма
-- Эту разницу вычти из price САМОЙ ДОРОГОЙ позиции по всем товарам
-- Пример: напечатано 1530, написано от руки 1468.8 → разница 61.2 → вычти 61.2 из самой дорогой позиции
 
 Другие правила:
 1. СКРИНШОТ КАССЫ: брать наименование и итоговую сумму по позиции.
-2. ФОТО ЭТИКЕТКИ: брать наименование с этикетки включая размер и артикул (если есть), цена будет в подписи к фото, qty=1.
-3. Если на чеке несколько товаров — вернуть массив из нескольких объектов.
+2. ФОТО ЭТИКЕТКИ: название с этикетки включая размер и артикул, цена из подписи, qty=1.
+3. Если несколько товаров — вернуть массив из нескольких объектов.
 4. Количество всегда 1, если не указано иное.
-5. Дату НЕ включай — она передаётся отдельно.{caption_part}{date_part}
+5. Дату НЕ включай.{caption_part}{date_part}
 
-Извлеки данные о продажах из этого изображения (или двух фото одного чека)."""
+Извлеки данные о продажах из всех переданных фото."""
 
 def extract_sales_from_images(images: list[tuple[bytes, str]], current_date: str = "") -> list[dict]:
-    """images — список (image_bytes, caption)"""
     captions = [cap for _, cap in images if cap]
     caption_part = f"\nПодписи к фото: {'; '.join(captions)}" if captions else ""
     date_part = f"\nДата продажи: {current_date}" if current_date else ""
@@ -290,7 +268,6 @@ def extract_sales_from_images(images: list[tuple[bytes, str]], current_date: str
 
 # ─── STATE ─────────────────────────────────────────────────────────────────────
 chat_dates: dict[int, str] = {}
-# Буфер для альбомов (media_group): media_group_id -> {photos, first_msg, date, task}
 media_group_buffer: dict[str, dict] = {}
 
 def parse_date_from_text(text: str) -> str | None:
@@ -306,14 +283,11 @@ def parse_date_from_text(text: str) -> str | None:
 
 # ─── HANDLERS ──────────────────────────────────────────────────────────────────
 async def process_images(images: list[tuple[bytes, str]], current_date: str, reply_msg):
-    """Обрабатываем одно или несколько фото, вносим в таблицу."""
     try:
         items = extract_sales_from_images(images, current_date)
-
         if not items:
-            await reply_msg.reply_text("❌ Не удалось распознать товары на изображении.")
+            await reply_msg.reply_text("❌ Не удалось распознать товары.")
             return
-
         for item in items:
             item["date"] = current_date
 
@@ -328,7 +302,7 @@ async def process_images(images: list[tuple[bytes, str]], current_date: str, rep
 
     except json.JSONDecodeError as e:
         logger.error(f"JSON parse error: {e}")
-        await reply_msg.reply_text("❌ Ошибка распознавания. Попробуй ещё раз или добавь вручную.")
+        await reply_msg.reply_text("❌ Ошибка распознавания. Попробуй ещё раз.")
     except Exception as e:
         logger.error(f"Error: {e}", exc_info=True)
         await reply_msg.reply_text(f"❌ Ошибка: {str(e)[:200]}")
@@ -361,7 +335,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     image_bytes = bytes(await file.download_as_bytearray())
 
-    # Если фото часть альбома (media_group) — собираем все фото вместе
     if msg.media_group_id:
         group_id = msg.media_group_id
         if group_id not in media_group_buffer:
@@ -370,20 +343,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "first_msg": msg,
                 "date": current_date,
             }
-            # Запускаем отложенную обработку через 3 секунды
             async def process_group(gid=group_id):
-                await asyncio.sleep(3)
+                await asyncio.sleep(5)
                 if gid not in media_group_buffer:
                     return
                 group = media_group_buffer.pop(gid)
-                await group["first_msg"].reply_text(f"⏳ Распознаю продажу ({len(group['photos'])} фото)...")
+                n = len(group["photos"])
+                await group["first_msg"].reply_text(f"⏳ Распознаю продажу ({n} фото)...")
                 await process_images(group["photos"], group["date"], group["first_msg"])
             asyncio.create_task(process_group())
 
         media_group_buffer[group_id]["photos"].append((image_bytes, caption))
         return
 
-    # Одиночное фото — обрабатываем сразу
     await msg.reply_text("⏳ Распознаю продажу...")
     await process_images([(image_bytes, caption)], current_date, msg)
 

@@ -24,16 +24,17 @@ GOOGLE_CREDS_JSON = os.environ["GOOGLE_CREDS_JSON"]
 PORT = int(os.environ.get("PORT", 8080))
 
 CATEGORY_SHEETS = {
-    "Игрушки":         ("H", "I"),
-    "Одежда":          ("F", "G"),
-    "Обувь":           ("E", "F"),
-    "Крупное":         ("J", "K"),
-    "Канцтовары":      ("E", "F"),
-    "Книги":           ("E", "F"),
-    "Украшения":       ("E", "F"),
-    "Спорт":           ("G", "H"),
-    "Детские товары":  ("D", "E"),
-    "Сумки и рюкзаки": ("D", "E"),
+    # (столбец_наименования, столбец_количества, столбец_цены)
+    "Игрушки":         ("D", "H", "I"),
+    "Одежда":          ("B", "F", "G"),
+    "Обувь":           ("A", "E", "F"),
+    "Крупное":         ("A", "J", "K"),
+    "Канцтовары":      ("A", "E", "F"),
+    "Книги":           ("A", "E", "F"),
+    "Украшения":       ("A", "E", "F"),
+    "Спорт":           ("C", "G", "H"),
+    "Детские товары":  ("A", "D", "E"),
+    "Сумки и рюкзаки": ("A", "D", "E"),
 }
 
 # ─── HEALTH CHECK ─────────────────────────────────────────────────────────────
@@ -98,7 +99,7 @@ def normalize(s: str) -> str:
     replacements = {'а':'a','е':'e','о':'o','р':'p','с':'c','х':'x','у':'y','в':'b','к':'k','м':'m','т':'t'}
     return ''.join(replacements.get(c, c) for c in s)
 
-def find_in_category(sheet, item: dict):
+def find_in_category(sheet, item: dict, name_col: str = "A"):
     """
     Поиск товара в листе категории:
     1. Берём артикул из названия товара
@@ -106,7 +107,7 @@ def find_in_category(sheet, item: dict):
     3. Если один кандидат — возвращаем его
     4. Если несколько — Gemini выбирает наиболее похожий
     """
-    all_values = sheet.col_values(1)
+    all_values = sheet.col_values(col_index(name_col))
     item_name = item.get("name", "")
     article_raw = extract_article_raw(item_name)
 
@@ -170,7 +171,10 @@ def update_category(sheet, row: int, qty: int, price, col_qty: str, col_price: s
     sheet.update_cell(row, qty_idx, new_qty)
 
     current_price = sheet.cell(row, price_idx).value or ""
-    price_str = str(int(price) if isinstance(price, float) and price == int(price) else price)
+    try:
+        price_str = str(int(price)) if isinstance(price, (int, float)) and float(price) == int(float(price)) else str(price)
+    except:
+        price_str = str(price)
     if current_price.strip():
         new_price = current_price.strip() + "+" + price_str
     else:
@@ -185,11 +189,11 @@ def append_sales(items: list[dict]):
 
     for i, item in enumerate(items):
         found_category = None
-        for cat_name, (col_qty, col_price) in CATEGORY_SHEETS.items():
+        for cat_name, (col_name, col_qty, col_price) in CATEGORY_SHEETS.items():
             cat_sheet = get_category_sheet(cat_name)
             if cat_sheet is None:
                 continue
-            row = find_in_category(cat_sheet, item)
+            row = find_in_category(cat_sheet, item, col_name)
             if row:
                 found_category = cat_name
                 try:
@@ -236,6 +240,7 @@ PROMPT_TEMPLATE = """Ты помощник, который извлекает д
 - В чеке строка выглядит так: КОЛ-ВО х ЦЕНА_ЗА_ШТ = ИТОГ
 - Пример: "2.000 х 390.00=780.00" → qty=2, price=780 (берём ИТОГ, не цену за штуку!)
 - В поле price всегда пиши ИТОГОВУЮ сумму по позиции (правая часть после знака =)
+- ВАЖНО: не теряй цифры! 590.00 → price=590, 1000.00 → price=1000, 260.00 → price=260
 
 Правила карточной оплаты:
 - Если рядом с напечатанным итогом чека написана другая сумма от руки — разница вычитается из самой дорогой позиции

@@ -113,7 +113,7 @@ def find_in_category(sheet, item: dict, name_col: str = "A"):
 
     if not article_raw:
         logger.info(f"Артикул не найден в названии: {item_name}")
-        return None
+        return None, None
 
     article_norm = normalize(article_raw)
     logger.info(f"Ищем артикул: '{article_raw}' (норм: '{article_norm}')")
@@ -172,9 +172,12 @@ def update_category(sheet, row: int, qty: int, price, col_qty: str, col_price: s
 
     current_price = sheet.cell(row, price_idx).value or ""
     try:
-        price_str = str(int(price)) if isinstance(price, (int, float)) and float(price) == int(float(price)) else str(price)
+        if isinstance(price, (int, float)) and float(price) == int(float(price)):
+            price_str = str(int(float(price)))
+        else:
+            price_str = str(price).replace('.', ',')
     except:
-        price_str = str(price)
+        price_str = str(price).replace('.', ',')
     if current_price.strip():
         new_price = current_price.strip() + "+" + price_str
     else:
@@ -189,13 +192,15 @@ def append_sales(items: list[dict]):
 
     for i, item in enumerate(items):
         found_category = None
+        found_name_in_registry = None
         for cat_name, (col_name, col_qty, col_price) in CATEGORY_SHEETS.items():
             cat_sheet = get_category_sheet(cat_name)
             if cat_sheet is None:
                 continue
-            row = find_in_category(cat_sheet, item, col_name)
+            row, registry_name = find_in_category(cat_sheet, item, col_name)
             if row:
                 found_category = cat_name
+                found_name_in_registry = registry_name
                 try:
                     update_category(cat_sheet, row, item["qty"], item["price"], col_qty, col_price)
                     logger.info(f"Обновлена категория '{cat_name}', строка {row}")
@@ -204,11 +209,13 @@ def append_sales(items: list[dict]):
                 break
             time.sleep(0.5)
 
+        # Используем название из описи если нашли, иначе название с чека
+        final_name = found_name_in_registry if found_name_in_registry else item["name"]
         note = "" if found_category else "не найдено в описи"
         rows.append([
             next_num + i,
             item["date"],
-            item["name"],
+            final_name,
             item["qty"],
             "",
             item["price"],

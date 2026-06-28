@@ -101,46 +101,76 @@ def normalize(s: str) -> str:
 
 def find_in_category(sheet, item: dict, name_col: str = "A"):
     """
-    Поиск товара в листе категории:
-    1. Берём артикул из названия товара
-    2. Ищем все строки где этот артикул встречается как подстрока (нормализованно)
-    3. Если один кандидат — возвращаем его
-    4. Если несколько — Gemini выбирает наиболее похожий
+    Поиск товара в листе категории.
+    Возвращает (row, name) или (None, None).
+    Шаг 1: ищем по артикулу как подстроке
+    Шаг 2: если не нашли по артикулу — Gemini ищет по смыслу среди всех строк
+    Шаг 3: если несколько кандидатов — Gemini выбирает лучший
     """
     all_values = sheet.col_values(col_index(name_col))
     item_name = item.get("name", "")
     article_raw = extract_article_raw(item_name)
 
-    if not article_raw:
-        logger.info(f"Артикул не найден в названии: {item_name}")
+    candidates = []
+
+    if article_raw:
+        article_norm = normalize(article_raw)
+        logger.info(f"Ищем артикул: '{article_raw}' (норм: '{article_norm}')")
+        for i, cell in enumerate(all_values):
+            if i == 0 or not cell.strip():
+                continue
+            if article_norm in normalize(cell):
+                candidates.append((i + 1, cell))
+        logger.info(f"Найдено по артикулу: {len(candidates)}")
+
+    # Если по артикулу не нашли — пробуем поиск по смыслу через Gemini
+    if not candidates:
+        logger.info(f"Артикул не дал результатов, пробуем поиск по смыслу")
+        all_rows = [(i + 1, cell) for i, cell in enumerate(all_values) if i > 0 and cell.strip()]
+        if not all_rows:
+            return None, None
+        # Ограничиваем до 100 строк чтобы не перегружать Gemini
+        sample = all_rows[:100]
+        candidates_text = "\n".join([f"{row}. {name}" for row, name in sample])
+        prompt = f"""Найди в списке товар который соответствует запросу.
+Сопоставляй по названию, артикулу, цвету и размеру.
+Игнорируй различия в регистре, пунктуации, порядке слов, русских/латинских буквах (а/a, е/e, о/o, с/c).
+
+Товар: {item_name}
+
+Список (номер строки. название):
+{candidates_text}
+
+Верни ТОЛЬКО номер строки если нашёл явное совпадение, или null если не уверен."""
+        try:
+            response = gemini_model.generate_content(prompt)
+            result = response.text.strip()
+            if result.lower() != "null":
+                m = re.search(r'\d+', result)
+                if m:
+                    row_num = int(m.group())
+                    found_name = next((name for row, name in sample if row == row_num), None)
+                    if found_name:
+                        logger.info(f"Найдено по смыслу: {found_name}")
+                        return row_num, found_name
+        except Exception as e:
+            logger.error(f"Ошибка Gemini при поиске по смыслу: {e}")
         return None, None
 
-    article_norm = normalize(article_raw)
-    logger.info(f"Ищем артикул: '{article_raw}' (норм: '{article_norm}')")
-
-    candidates = []
-    for i, cell in enumerate(all_values):
-        if i == 0 or not cell.strip():
-            continue
-        if article_norm in normalize(cell):
-            candidates.append((i + 1, cell))
-
-    logger.info(f"Найдено кандидатов: {len(candidates)}")
-
-    if not candidates:
-        return None
-
+    # Один кандидат
     if len(candidates) == 1:
         logger.info(f"Единственный кандидат: {candidates[0][1]}")
-        return candidates[0][0]
+        return candidates[0][0], candidates[0][1]
 
     # Несколько кандидатов — Gemini выбирает
+    if len(candidates) > 50:
+        candidates = candidates[:50]
     candidates_text = "\n".join([f"{row}. {name}" for row, name in candidates])
     prompt = f"""Найди в списке товар который соответствует запросу.
 Сопоставляй по артикулу, названию, цвету и размеру.
 Игнорируй различия в регистре, пунктуации, порядке слов, русских/латинских буквах.
 
-Товар из чека: {item_name}
+Товар: {item_name}
 
 Кандидаты (номер строки. название):
 {candidates_text}
@@ -152,12 +182,17 @@ def find_in_category(sheet, item: dict, name_col: str = "A"):
         result = response.text.strip()
         logger.info(f"Gemini выбрал: {result}")
         if result.lower() == "null":
-            return None
+            return None, None
         m = re.search(r'\d+', result)
-        return int(m.group()) if m else None
+        if not m:
+            return None, None
+        row_num = int(m.group())
+        found_name = next((name for row, name in candidates if row == row_num), None)
+        return row_num, found_name
     except Exception as e:
         logger.error(f"Ошибка Gemini при выборе кандидата: {e}")
-        return None
+        return None, None
+
 
 def update_category(sheet, row: int, qty: int, price, col_qty: str, col_price: str):
     qty_idx = col_index(col_qty)
@@ -197,7 +232,11 @@ def append_sales(items: list[dict]):
             cat_sheet = get_category_sheet(cat_name)
             if cat_sheet is None:
                 continue
-            row, registry_name = find_in_category(cat_sheet, item, col_name)
+            try:
+                row, registry_name = find_in_category(cat_sheet, item, col_name)
+            except Exception as e:
+                logger.error(f"Ошибка поиска в категории {cat_name}: {e}")
+                row, registry_name = None, None
             if row:
                 found_category = cat_name
                 found_name_in_registry = registry_name
@@ -207,7 +246,7 @@ def append_sales(items: list[dict]):
                 except Exception as e:
                     logger.error(f"Ошибка обновления категории: {e}")
                 break
-            time.sleep(0.5)
+            time.sleep(1.5)  # пауза чтобы не превысить лимит Google Sheets
 
         # Используем название из описи если нашли, иначе название с чека
         final_name = found_name_in_registry if found_name_in_registry else item["name"]
@@ -256,7 +295,8 @@ PROMPT_TEMPLATE = """Ты помощник, который извлекает д
 Другие правила:
 1. СКРИНШОТ КАССЫ: брать наименование и итоговую сумму по позиции.
 2. ФОТО ЭТИКЕТКИ: название с этикетки включая размер и артикул, цена из подписи, qty=1.
-3. Если несколько товаров — вернуть массив из нескольких объектов.
+3. ФОТО БЕЗ ЭТИКЕТКИ: если на фото просто товар без ярлыка — определи что это за товар по внешнему виду, запиши описательное название, цену возьми из подписи к фото, qty=1.
+4. Если несколько товаров — вернуть массив из нескольких объектов.
 4. Количество всегда 1, если не указано иное.
 5. Дату НЕ включай.{caption_part}{date_part}
 

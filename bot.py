@@ -102,62 +102,34 @@ def normalize(s: str) -> str:
 def find_in_category(sheet, item: dict, name_col: str = "A"):
     """
     Поиск товара в листе категории.
-    Возвращает (row, name) или (None, None).
-    Шаг 1: ищем по артикулу как подстроке
-    Шаг 2: если не нашли по артикулу — Gemini ищет по смыслу среди всех строк
-    Шаг 3: если несколько кандидатов — Gemini выбирает лучший
+    1. Ищем по артикулу как подстроке
+    2. Если один кандидат — возвращаем сразу
+    3. Если несколько — Gemini выбирает из них (1 запрос)
+    4. Если артикул не найден — возвращаем (None, None)
     """
     all_values = sheet.col_values(col_index(name_col))
     item_name = item.get("name", "")
     article_raw = extract_article_raw(item_name)
 
-    candidates = []
-
-    if article_raw:
-        article_norm = normalize(article_raw)
-        logger.info(f"Ищем артикул: '{article_raw}' (норм: '{article_norm}')")
-        for i, cell in enumerate(all_values):
-            if i == 0 or not cell.strip():
-                continue
-            if article_norm in normalize(cell):
-                candidates.append((i + 1, cell))
-        logger.info(f"Найдено по артикулу: {len(candidates)}")
-
-    # Если по артикулу не нашли — пробуем поиск по смыслу через Gemini
-    if not candidates:
-        logger.info(f"Артикул не дал результатов, пробуем поиск по смыслу")
-        all_rows = [(i + 1, cell) for i, cell in enumerate(all_values) if i > 0 and cell.strip()]
-        if not all_rows:
-            return None, None
-        # Ограничиваем до 100 строк чтобы не перегружать Gemini
-        sample = all_rows[:100]
-        candidates_text = "\n".join([f"{row}. {name}" for row, name in sample])
-        prompt = f"""Найди в списке товар который соответствует запросу.
-Сопоставляй по названию, артикулу, цвету и размеру.
-Игнорируй различия в регистре, пунктуации, порядке слов, русских/латинских буквах (а/a, е/e, о/o, с/c).
-
-Товар: {item_name}
-
-Список (номер строки. название):
-{candidates_text}
-
-Верни ТОЛЬКО номер строки если нашёл явное совпадение, или null если не уверен."""
-        try:
-            response = gemini_model.generate_content(prompt)
-            result = response.text.strip()
-            if result.lower() != "null":
-                m = re.search(r'\d+', result)
-                if m:
-                    row_num = int(m.group())
-                    found_name = next((name for row, name in sample if row == row_num), None)
-                    if found_name:
-                        logger.info(f"Найдено по смыслу: {found_name}")
-                        return row_num, found_name
-        except Exception as e:
-            logger.error(f"Ошибка Gemini при поиске по смыслу: {e}")
+    if not article_raw:
+        logger.info(f"Артикул не найден в названии: {item_name}")
         return None, None
 
-    # Один кандидат
+    article_norm = normalize(article_raw)
+    logger.info(f"Ищем артикул: '{article_raw}' (норм: '{article_norm}')")
+
+    candidates = []
+    for i, cell in enumerate(all_values):
+        if i == 0 or not cell.strip():
+            continue
+        if article_norm in normalize(cell):
+            candidates.append((i + 1, cell))
+
+    logger.info(f"Найдено кандидатов: {len(candidates)}")
+
+    if not candidates:
+        return None, None
+
     if len(candidates) == 1:
         logger.info(f"Единственный кандидат: {candidates[0][1]}")
         return candidates[0][0], candidates[0][1]

@@ -86,6 +86,23 @@ def get_next_sale_number(sheet):
 def col_index(letter):
     return ord(letter.upper()) - ord('A') + 1
 
+def gemini_generate(prompt_or_content, retries=3, wait=30):
+    """Вызов Gemini с автоповтором при ошибке 429."""
+    for attempt in range(retries):
+        try:
+            if isinstance(prompt_or_content, list):
+                response = gemini_model.generate_content(prompt_or_content)
+            else:
+                response = gemini_model.generate_content(prompt_or_content)
+            return response
+        except Exception as e:
+            if "429" in str(e) and attempt < retries - 1:
+                logger.warning(f"Лимит Gemini, жду {wait} сек (попытка {attempt+1}/{retries})")
+                time.sleep(wait)
+            else:
+                raise
+    return None
+
 def extract_article_raw(name: str) -> str | None:
     """Извлекаем артикул как есть — всё что после 'арт.' до скобки, запятой или конца строки."""
     m = re.search(r'арт[.\s]*\(?\s*([^\s\),]+(?:\s+[^\s\),]+)*)', name, re.IGNORECASE)
@@ -150,7 +167,7 @@ def find_in_category(sheet, item: dict, name_col: str = "A"):
 Верни ТОЛЬКО номер строки подходящего товара, или null если ни один не подходит."""
 
     try:
-        response = gemini_model.generate_content(prompt)
+        response = gemini_generate(prompt)
         result = response.text.strip()
         logger.info(f"Gemini выбрал: {result}")
         if result.lower() == "null":
@@ -284,7 +301,7 @@ def extract_sales_from_images(images: list[tuple[bytes, str]], current_date: str
     for image_bytes, _ in images:
         content.append({"mime_type": "image/jpeg", "data": image_bytes})
 
-    response = gemini_model.generate_content(content)
+    response = gemini_generate(content)
     raw = response.text.strip()
     raw = re.sub(r"```json|```", "", raw).strip()
     items = json.loads(raw)

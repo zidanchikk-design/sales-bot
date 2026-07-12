@@ -15,7 +15,7 @@ from google.oauth2.service_account import Credentials
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# ─── CONFIG ───────────────────────────────────────────────────────────────────
+# CONFIG
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 SPREADSHEET_ID = os.environ["SPREADSHEET_ID"]
@@ -24,7 +24,6 @@ GOOGLE_CREDS_JSON = os.environ["GOOGLE_CREDS_JSON"]
 PORT = int(os.environ.get("PORT", 8080))
 
 CATEGORY_SHEETS = {
-    # (столбец_наименования, столбец_количества, столбец_цены)
     "Игрушки":         ("D", "H", "I"),
     "Одежда":          ("B", "F", "G"),
     "Обувь":           ("A", "E", "F"),
@@ -37,7 +36,6 @@ CATEGORY_SHEETS = {
     "Сумки и рюкзаки": ("A", "D", "E"),
 }
 
-# ─── HEALTH CHECK ─────────────────────────────────────────────────────────────
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -50,7 +48,6 @@ def run_health_server():
     server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
     server.serve_forever()
 
-# ─── GOOGLE SHEETS ─────────────────────────────────────────────────────────────
 _gc = None
 _spreadsheet = None
 
@@ -87,13 +84,9 @@ def col_index(letter):
     return ord(letter.upper()) - ord('A') + 1
 
 def gemini_generate(prompt_or_content, retries=3, wait=30):
-    """Вызов Gemini с автоповтором при ошибке 429."""
     for attempt in range(retries):
         try:
-            if isinstance(prompt_or_content, list):
-                response = gemini_model.generate_content(prompt_or_content)
-            else:
-                response = gemini_model.generate_content(prompt_or_content)
+            response = gemini_model.generate_content(prompt_or_content)
             return response
         except Exception as e:
             if "429" in str(e) and attempt < retries - 1:
@@ -103,28 +96,45 @@ def gemini_generate(prompt_or_content, retries=3, wait=30):
                 raise
     return None
 
-def extract_article_raw(name: str) -> str | None:
-    """Извлекаем артикул как есть — всё что после 'арт.' до скобки, запятой или конца строки."""
+def sheets_call_with_retry(func, retries=4, wait=20):
+    for attempt in range(retries):
+        try:
+            return func()
+        except Exception as e:
+            if "429" in str(e) and attempt < retries - 1:
+                logger.warning(f"Лимит Sheets, жду {wait} сек (попытка {attempt+1}/{retries})")
+                time.sleep(wait)
+            else:
+                raise
+
+def normalize(s: str) -> str:
+    s = s.lower()
+    replacements = {'а':'a','е':'e','о':'o','р':'p','с':'c','х':'x','у':'y','в':'b','к':'k','м':'m','т':'t'}
+    return ''.join(replacements.get(c, c) for c in s)
+
+def extract_article_raw(name: str):
     m = re.search(r'арт[.\s]*\(?\s*([^\s\),]+(?:\s+[^\s\),]+)*)', name, re.IGNORECASE)
     if m:
         return m.group(1).strip().rstrip(')')
     return None
 
-def normalize(s: str) -> str:
-    """Нормализуем строку: нижний регистр, кириллица→латиница для похожих букв."""
-    s = s.lower()
-    replacements = {'а':'a','е':'e','о':'o','р':'p','с':'c','х':'x','у':'y','в':'b','к':'k','м':'m','т':'t'}
-    return ''.join(replacements.get(c, c) for c in s)
+def get_article_parts(article: str) -> list:
+    """Разбиваем артикул на части для поиска по подстроке."""
+    article_norm = normalize(article)
+    parts = [article_norm]
+    # Разбиваем по дефису и пробелу
+    subparts = re.split(r'[-\s]', article_norm)
+    for part in subparts:
+        if len(part) >= 4 and part not in parts:
+            parts.append(part)
+    # Только цифры
+    digits = re.sub(r'[^0-9]', '', article_norm)
+    if len(digits) >= 4 and digits not in parts:
+        parts.append(digits)
+    return parts
 
 def find_in_category(sheet, item: dict, name_col: str = "A"):
-    """
-    Поиск товара в листе категории.
-    1. Ищем по артикулу как подстроке
-    2. Если один кандидат — возвращаем сразу
-    3. Если несколько — Gemini выбирает из них (1 запрос)
-    4. Если артикул не найден — возвращаем (None, None)
-    """
-    all_values = sheet.col_values(col_index(name_col))
+    all_values = sheets_call_with_retry(lambda: sheet.col_values(col_index(name_col)))
     item_name = item.get("name", "")
     article_raw = extract_article_raw(item_name)
 
@@ -132,15 +142,18 @@ def find_in_category(sheet, item: dict, name_col: str = "A"):
         logger.info(f"Артикул не найден в названии: {item_name}")
         return None, None
 
-    article_norm = normalize(article_raw)
-    logger.info(f"Ищем артикул: '{article_raw}' (норм: '{article_norm}')")
+    article_parts = get_article_parts(article_raw)
+    logger.info(f"Ищем артикул: '{article_raw}', части: {article_parts}")
 
     candidates = []
     for i, cell in enumerate(all_values):
         if i == 0 or not cell.strip():
             continue
-        if article_norm in normalize(cell):
-            candidates.append((i + 1, cell))
+        cell_norm = normalize(cell)
+        for part in article_parts:
+            if part in cell_norm:
+                candidates.append((i + 1, cell))
+                break
 
     logger.info(f"Найдено кандидатов: {len(candidates)}")
 
@@ -151,9 +164,9 @@ def find_in_category(sheet, item: dict, name_col: str = "A"):
         logger.info(f"Единственный кандидат: {candidates[0][1]}")
         return candidates[0][0], candidates[0][1]
 
-    # Несколько кандидатов — Gemini выбирает
     if len(candidates) > 50:
         candidates = candidates[:50]
+
     candidates_text = "\n".join([f"{row}. {name}" for row, name in candidates])
     prompt = f"""Найди в списке товар который соответствует запросу.
 Сопоставляй по артикулу, названию, цвету и размеру.
@@ -182,19 +195,18 @@ def find_in_category(sheet, item: dict, name_col: str = "A"):
         logger.error(f"Ошибка Gemini при выборе кандидата: {e}")
         return None, None
 
-
 def update_category(sheet, row: int, qty: int, price, col_qty: str, col_price: str):
     qty_idx = col_index(col_qty)
     price_idx = col_index(col_price)
 
-    current_qty = sheet.cell(row, qty_idx).value
+    current_qty = sheets_call_with_retry(lambda: sheet.cell(row, qty_idx).value)
     try:
         new_qty = int(current_qty or 0) + qty
     except:
         new_qty = qty
-    sheet.update_cell(row, qty_idx, new_qty)
+    sheets_call_with_retry(lambda: sheet.update_cell(row, qty_idx, new_qty))
 
-    current_price = sheet.cell(row, price_idx).value or ""
+    current_price = sheets_call_with_retry(lambda: sheet.cell(row, price_idx).value) or ""
     try:
         if isinstance(price, (int, float)) and float(price) == int(float(price)):
             price_str = str(int(float(price)))
@@ -206,9 +218,9 @@ def update_category(sheet, row: int, qty: int, price, col_qty: str, col_price: s
         new_price = current_price.strip() + "+" + price_str
     else:
         new_price = price_str
-    sheet.update_cell(row, price_idx, new_price)
+    sheets_call_with_retry(lambda: sheet.update_cell(row, price_idx, new_price))
 
-def append_sales(items: list[dict]):
+def append_sales(items: list):
     main_sheet = get_main_sheet()
     next_num = get_next_sale_number(main_sheet)
     rows = []
@@ -235,9 +247,8 @@ def append_sales(items: list[dict]):
                 except Exception as e:
                     logger.error(f"Ошибка обновления категории: {e}")
                 break
-            time.sleep(1.5)  # пауза чтобы не превысить лимит Google Sheets
+            time.sleep(3)
 
-        # Используем название из описи если нашли, иначе название с чека
         final_name = found_name_in_registry if found_name_in_registry else item["name"]
         note = "" if found_category else "не найдено в описи"
         rows.append([
@@ -255,9 +266,9 @@ def append_sales(items: list[dict]):
     logger.info(f"Добавлено {len(rows)} строк начиная с № {next_num}")
     return next_num, len(rows), category_results
 
-# ─── GEMINI ────────────────────────────────────────────────────────────────────
+# GEMINI
 genai.configure(api_key=GEMINI_API_KEY)
-gemini_model = genai.GenerativeModel("gemini-2.5-flash")
+gemini_model = genai.GenerativeModel("gemini-2.0-flash")
 
 PROMPT_TEMPLATE = """Ты помощник, который извлекает данные о продажах из изображений для магазина детских товаров.
 
@@ -268,14 +279,14 @@ PROMPT_TEMPLATE = """Ты помощник, который извлекает д
 {{
   "name": "полное наименование товара как на этикетке/чеке, включая размер и артикул если есть (формат: Наименование, р.XX, арт. XXXXX)",
   "qty": число (количество штук),
-  "price": число (ИТОГОВАЯ сумма по позиции = количество × цена за штуку, может быть дробным с копейками)
+  "price": число (ИТОГОВАЯ сумма по позиции = количество x цена за штуку, может быть дробным с копейками)
 }}
 
 Правила извлечения цены:
 - В чеке строка выглядит так: КОЛ-ВО х ЦЕНА_ЗА_ШТ = ИТОГ
-- Пример: "2.000 х 390.00=780.00" → qty=2, price=780 (берём ИТОГ, не цену за штуку!)
+- Пример: "2.000 х 390.00=780.00" -> qty=2, price=780 (берём ИТОГ, не цену за штуку!)
 - В поле price всегда пиши ИТОГОВУЮ сумму по позиции (правая часть после знака =)
-- ВАЖНО: не теряй цифры! 590.00 → price=590, 1000.00 → price=1000, 260.00 → price=260
+- ВАЖНО: не теряй цифры! 590.00 -> price=590, 1000.00 -> price=1000, 260.00 -> price=260
 
 Правила карточной оплаты:
 - Если рядом с напечатанным итогом чека написана другая сумма от руки — разница вычитается из самой дорогой позиции
@@ -286,12 +297,12 @@ PROMPT_TEMPLATE = """Ты помощник, который извлекает д
 2. ФОТО ЭТИКЕТКИ: название с этикетки включая размер и артикул, цена из подписи, qty=1.
 3. ФОТО БЕЗ ЭТИКЕТКИ: если на фото просто товар без ярлыка — определи что это за товар по внешнему виду, запиши описательное название, цену возьми из подписи к фото, qty=1.
 4. Если несколько товаров — вернуть массив из нескольких объектов.
-4. Количество всегда 1, если не указано иное.
-5. Дату НЕ включай.{caption_part}{date_part}
+5. Количество всегда 1, если не указано иное.
+6. Дату НЕ включай.{caption_part}{date_part}
 
 Извлеки данные о продажах из всех переданных фото."""
 
-def extract_sales_from_images(images: list[tuple[bytes, str]], current_date: str = "") -> list[dict]:
+def extract_sales_from_images(images: list, current_date: str = "") -> list:
     captions = [cap for _, cap in images if cap]
     caption_part = f"\nПодписи к фото: {'; '.join(captions)}" if captions else ""
     date_part = f"\nДата продажи: {current_date}" if current_date else ""
@@ -307,11 +318,10 @@ def extract_sales_from_images(images: list[tuple[bytes, str]], current_date: str
     items = json.loads(raw)
     return items if isinstance(items, list) else [items]
 
-# ─── STATE ─────────────────────────────────────────────────────────────────────
-chat_dates: dict[int, str] = {}
-media_group_buffer: dict[str, dict] = {}
+chat_dates: dict = {}
+media_group_buffer: dict = {}
 
-def parse_date_from_text(text: str) -> str | None:
+def parse_date_from_text(text: str):
     patterns = [
         r"\b(\d{2}\.\d{2}\.\d{4})\b",
         r"\b(\d{2}\.\d{2}\.\d{2})\b",
@@ -322,8 +332,7 @@ def parse_date_from_text(text: str) -> str | None:
             return m.group(1)
     return None
 
-# ─── HANDLERS ──────────────────────────────────────────────────────────────────
-async def process_images(images: list[tuple[bytes, str]], current_date: str, reply_msg):
+async def process_images(images: list, current_date: str, reply_msg):
     try:
         items = extract_sales_from_images(images, current_date)
         if not items:
@@ -400,7 +409,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await msg.reply_text("⏳ Распознаю продажу...")
     await process_images([(image_bytes, caption)], current_date, msg)
 
-# ─── MAIN ──────────────────────────────────────────────────────────────────────
 def main():
     t = threading.Thread(target=run_health_server, daemon=True)
     t.start()

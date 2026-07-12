@@ -15,7 +15,6 @@ from google.oauth2.service_account import Credentials
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# CONFIG
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 SPREADSHEET_ID = os.environ["SPREADSHEET_ID"]
@@ -34,6 +33,20 @@ CATEGORY_SHEETS = {
     "Спорт":           ("C", "G", "H"),
     "Детские товары":  ("A", "D", "E"),
     "Сумки и рюкзаки": ("A", "D", "E"),
+}
+
+# Ключевые слова для определения категории БЕЗ Gemini
+CATEGORY_KEYWORDS = {
+    "Обувь": ["ботинк", "туфл", "сапог", "кроссовк", "кед", "мокасин", "полуботинк", "сандал", "балетк", "слипон", "тапк", "галош", "валенк", "угг", "кроссовк"],
+    "Одежда": ["куртк", "пальто", "платье", "брюк", "джинс", "костюм", "комбинез", "свитер", "кофт", "футболк", "шорт", "юбк", "водолазк", "толстовк", "рубашк", "варежк", "рукавиц", "шапк", "шарф", "перчатк", "колготк", "носк", "боди", "комплект курт", "комплект одежд"],
+    "Книги": ["книг", "букварь", "азбук", "энциклопед", "сказк", "рассказ", "стих", "литератур", "учебник", "пособ", "раскраск"],
+    "Канцтовары": ["ручк", "карандаш", "тетрад", "альбом", "краск", "фломастер", "пластилин", "ножниц", "клей", "линейк", "пенал", "папк", "блокнот"],
+    "Украшения": ["украшен", "браслет", "серьг", "колье", "ободок", "заколк", "резинк для волос", "бусы", "кольцо"],
+    "Сумки и рюкзаки": ["рюкзак", "сумк", "портфель", "мешок для обув", "пенал"],
+    "Спорт": ["велосипед", "самокат", "ролик", "коньк", "лыж", "мяч", "ракетк", "скейт", "беговел"],
+    "Крупное": ["коляск", "кроватк", "манеж", "стул детск", "автокресл", "велосипед", "стол детск"],
+    "Детские товары": ["пустышк", "бутылочк", "подгузник", "горшок", "ванночк", "термометр", "молокоотсос", "конверт", "пеленк", "слинг"],
+    "Игрушки": ["игрушк", "кукл", "пупс", "машинк", "конструктор", "мозаик", "пазл", "набор игров", "мягк", "плюш", "погремушк", "каталк", "качалк", "зайк", "мишк", "лисичк", "собачк", "кошечк", "тигр", "слон", "жираф", "единорог"],
 }
 
 class HealthHandler(BaseHTTPRequestHandler):
@@ -102,7 +115,7 @@ def sheets_call_with_retry(func, retries=4, wait=20):
             return func()
         except Exception as e:
             if "429" in str(e) and attempt < retries - 1:
-                logger.warning(f"Лимит Sheets, жду {wait} сек (попытка {attempt+1}/{retries})")
+                logger.warning(f"Лимит Sheets, жду {wait} сек")
                 time.sleep(wait)
             else:
                 raise
@@ -112,6 +125,17 @@ def normalize(s: str) -> str:
     replacements = {'а':'a','е':'e','о':'o','р':'p','с':'c','х':'x','у':'y','в':'b','к':'k','м':'m','т':'t'}
     return ''.join(replacements.get(c, c) for c in s)
 
+def detect_category(item_name: str) -> str | None:
+    """Определяем категорию товара по ключевым словам в названии. Без Gemini!"""
+    name_lower = item_name.lower()
+    for cat_name, keywords in CATEGORY_KEYWORDS.items():
+        for kw in keywords:
+            if kw in name_lower:
+                logger.info(f"Категория определена как '{cat_name}' по слову '{kw}'")
+                return cat_name
+    logger.info(f"Категория не определена для: {item_name}")
+    return None
+
 def extract_article_raw(name: str):
     m = re.search(r'арт[.\s]*\(?\s*([^\s\),]+(?:\s+[^\s\),]+)*)', name, re.IGNORECASE)
     if m:
@@ -119,15 +143,12 @@ def extract_article_raw(name: str):
     return None
 
 def get_article_parts(article: str) -> list:
-    """Разбиваем артикул на части для поиска по подстроке."""
     article_norm = normalize(article)
     parts = [article_norm]
-    # Разбиваем по дефису и пробелу
     subparts = re.split(r'[-\s]', article_norm)
     for part in subparts:
         if len(part) >= 4 and part not in parts:
             parts.append(part)
-    # Только цифры
     digits = re.sub(r'[^0-9]', '', article_norm)
     if len(digits) >= 4 and digits not in parts:
         parts.append(digits)
@@ -229,25 +250,23 @@ def append_sales(items: list):
     for i, item in enumerate(items):
         found_category = None
         found_name_in_registry = None
-        for cat_name, (col_name, col_qty, col_price) in CATEGORY_SHEETS.items():
+
+        # Определяем категорию по ключевым словам (без Gemini!)
+        cat_name = detect_category(item.get("name", ""))
+
+        if cat_name and cat_name in CATEGORY_SHEETS:
+            col_name, col_qty, col_price = CATEGORY_SHEETS[cat_name]
             cat_sheet = get_category_sheet(cat_name)
-            if cat_sheet is None:
-                continue
-            try:
-                row, registry_name = find_in_category(cat_sheet, item, col_name)
-            except Exception as e:
-                logger.error(f"Ошибка поиска в категории {cat_name}: {e}")
-                row, registry_name = None, None
-            if row:
-                found_category = cat_name
-                found_name_in_registry = registry_name
+            if cat_sheet:
                 try:
-                    update_category(cat_sheet, row, item["qty"], item["price"], col_qty, col_price)
-                    logger.info(f"Обновлена категория '{cat_name}', строка {row}")
+                    row, registry_name = find_in_category(cat_sheet, item, col_name)
+                    if row:
+                        found_category = cat_name
+                        found_name_in_registry = registry_name
+                        update_category(cat_sheet, row, item["qty"], item["price"], col_qty, col_price)
+                        logger.info(f"Обновлена категория '{cat_name}', строка {row}")
                 except Exception as e:
-                    logger.error(f"Ошибка обновления категории: {e}")
-                break
-            time.sleep(3)
+                    logger.error(f"Ошибка поиска/обновления в категории {cat_name}: {e}")
 
         final_name = found_name_in_registry if found_name_in_registry else item["name"]
         note = "" if found_category else "не найдено в описи"
@@ -266,7 +285,6 @@ def append_sales(items: list):
     logger.info(f"Добавлено {len(rows)} строк начиная с № {next_num}")
     return next_num, len(rows), category_results
 
-# GEMINI
 genai.configure(api_key=GEMINI_API_KEY)
 gemini_model = genai.GenerativeModel("gemini-2.0-flash")
 

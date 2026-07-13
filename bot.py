@@ -308,22 +308,33 @@ def append_sales(items: list):
         found_category = None
         found_name_in_registry = None
 
-        # Определяем категорию по ключевым словам (без Gemini!)
-        cat_name = detect_category(item.get("name", ""))
+        # Определяем вероятную категорию по ключевым словам
+        primary_cat = detect_category(item.get("name", ""))
 
-        if cat_name and cat_name in CATEGORY_SHEETS:
+        # Составляем порядок поиска: сначала вероятная категория, потом все остальные
+        if primary_cat:
+            search_order = [primary_cat] + [c for c in CATEGORY_SHEETS if c != primary_cat]
+        else:
+            search_order = list(CATEGORY_SHEETS.keys())
+
+        for cat_name in search_order:
+            if cat_name not in CATEGORY_SHEETS:
+                continue
             col_name, col_qty, col_price = CATEGORY_SHEETS[cat_name]
             cat_sheet = get_category_sheet(cat_name)
-            if cat_sheet:
-                try:
-                    row, registry_name = find_in_category(cat_sheet, item, col_name)
-                    if row:
-                        found_category = cat_name
-                        found_name_in_registry = registry_name
-                        update_category(cat_sheet, row, item["qty"], item["price"], col_qty, col_price)
-                        logger.info(f"Обновлена категория '{cat_name}', строка {row}")
-                except Exception as e:
-                    logger.error(f"Ошибка поиска/обновления в категории {cat_name}: {e}")
+            if not cat_sheet:
+                continue
+            try:
+                row, registry_name = find_in_category(cat_sheet, item, col_name)
+                if row:
+                    found_category = cat_name
+                    found_name_in_registry = registry_name
+                    update_category(cat_sheet, row, item["qty"], item["price"], col_qty, col_price)
+                    logger.info(f"Обновлена категория '{cat_name}', строка {row}")
+                    break
+            except Exception as e:
+                logger.error(f"Ошибка поиска в категории {cat_name}: {e}")
+            time.sleep(2)
 
         final_name = found_name_in_registry if found_name_in_registry else item["name"]
         note = "" if found_category else "не найдено в описи"

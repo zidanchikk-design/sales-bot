@@ -286,7 +286,7 @@ def append_sales(items: list):
     return next_num, len(rows), category_results
 
 genai.configure(api_key=GEMINI_API_KEY)
-gemini_model = genai.GenerativeModel("gemini-2.5-flash-lite-preview-06-17")
+gemini_model = genai.GenerativeModel("gemini-3.1-flash-lite-preview")
 
 PROMPT_TEMPLATE = """Ты помощник, который извлекает данные о продажах из изображений для магазина детских товаров.
 
